@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+/* Clean Tailwind-only stylesheet */
+/* All styling is now handled by Tailwind utility classes */
+
+body {
+  margin: 0;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+}
