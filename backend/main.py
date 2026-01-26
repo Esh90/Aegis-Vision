@@ -56,12 +56,15 @@ app.add_middleware(
 class Config:
     FACE_DATABASE_DIR = Path("./face_database")
     MODELS_DIR = Path("./models")
+    VIDEO_UPLOADS_DIR = Path("./video_uploads")
     CONFIDENCE_THRESHOLD = 0.4  # Lowered for easier matching (was 0.6)
     FACE_DETECTION_CONFIDENCE = 0.5
     MAX_DETECTIONS_BUFFER = 500
+    SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
     
 Config.FACE_DATABASE_DIR.mkdir(exist_ok=True)
 Config.MODELS_DIR.mkdir(exist_ok=True)
+Config.VIDEO_UPLOADS_DIR.mkdir(exist_ok=True)
 
 
 # Global state with thread-safe operations
@@ -75,6 +78,22 @@ class SurveillanceState:
         self.frame_count = 0
         self.fps = 0
         self.last_fps_time = time.time()
+        
+        # Video source management
+        self.video_source_type = "webcam"  # webcam, file, rtsp
+        self.video_source_path = None
+        self.video_total_frames = 0
+        self.video_current_frame = 0
+        self.video_processing_complete = False
+        self.current_session_stats = {
+            "total_faces": 0,
+            "unique_individuals": set(),
+            "high_risk_count": 0,
+            "medium_risk_count": 0,
+            "low_risk_count": 0,
+            "start_time": None,
+            "end_time": None
+        }
         
 surveillance_state = SurveillanceState()
 
@@ -162,23 +181,72 @@ ai_models = AIModels()
 class VideoProcessor:
     """Production-grade video processor with full AI pipeline"""
     
-    def __init__(self, source=0, camera_id="CAM-001", location="Unknown"):
+    def __init__(self, source=0, camera_id="CAM-001", location="Unknown", source_type="webcam"):
         self.source = source
         self.camera_id = camera_id
         self.location = location
+        self.source_type = source_type  # webcam, file, rtsp
         self.cap = None
         self.running = False
         self.frame_skip_counter = 0
         self.face_recognition_interval = 5  # Process face recognition every 5 frames
+        self.total_frames = 0
+        self.current_frame_number = 0
         
     def start(self):
         """Initialize video capture with optimizations"""
-        self.cap = cv2.VideoCapture(self.source)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)  # Higher resolution
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        print(f"\n📹 Starting video source: {self.source_type}")
+        print(f"   Source: {self.source}")
+        
+        # Use DirectShow backend for Windows webcams (much faster)
+        if isinstance(self.source, int):
+            self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(self.source)
+        
+        if not self.cap.isOpened():
+            print(f"❌ Failed to open video source: {self.source}")
+            return False
+        
+        # Set resolution to 1280x720 for webcams (HD quality)
+        # For IP cameras/files, resolution is auto-detected
+        if isinstance(self.source, int):  # Webcam
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffering for low latency
+        
+        # Get total frames for video files
+        if self.source_type == "file":
+            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            duration = self.total_frames / fps if fps > 0 else 0
+            print(f"   📊 Video info: {self.total_frames} frames, {fps:.2f} FPS, {duration:.2f}s duration")
+            surveillance_state.video_total_frames = self.total_frames
+        
+        self.running = True
+        print(f"✅ Video source started successfully")
+        
+        # Reset session stats
+        with surveillance_state.lock:
+            surveillance_state.current_session_stats = {
+                "total_faces": 0,
+                "unique_individuals": set(),
+                "high_risk_count": 0,
+                "medium_risk_count": 0,
+                "low_risk_count": 0,
+                "unknown_count": 0,
+                "start_time": datetime.now().isoformat(),
+                "end_time": None
+            }
+            surveillance_state.video_processing_complete = False
+            surveillance_state.video_current_frame = 0
+        
+        return True
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce latency
         self.running = True
+        print(f"📹 Video source started: {self.source}")
         
     def stop(self):
         self.running = False
@@ -508,6 +576,37 @@ class VideoProcessor:
             
             detections.append(detection)
         
+        # Update session statistics
+        with surveillance_state.lock:
+            surveillance_state.current_session_stats['total_faces'] += len(faces)
+            for det in detections:
+                if det['person_id'] and not det['person_id'].startswith('unknown_'):
+                    surveillance_state.current_session_stats['unique_individuals'].add(det['person_id'])
+                
+                risk = det['risk_level']
+                if risk == 'HIGH':
+                    surveillance_state.current_session_stats['high_risk_count'] += 1
+                elif risk == 'MEDIUM':
+                    surveillance_state.current_session_stats['medium_risk_count'] += 1
+                elif risk == 'LOW':
+                    surveillance_state.current_session_stats['low_risk_count'] += 1
+                else:
+                    surveillance_state.current_session_stats['unknown_count'] += 1
+            
+            # Update video progress for file sources
+            if self.source_type == "file":
+                self.current_frame_number += 1
+                surveillance_state.video_current_frame = self.current_frame_number
+                
+                # Check if video is complete
+                if self.total_frames > 0 and self.current_frame_number >= self.total_frames:
+                    surveillance_state.video_processing_complete = True
+                    surveillance_state.current_session_stats['end_time'] = datetime.now().isoformat()
+                    print(f"\n🎬 Video processing complete!")
+                    print(f"   Total frames: {self.total_frames}")
+                    print(f"   Total faces detected: {surveillance_state.current_session_stats['total_faces']}")
+                    print(f"   Unique individuals: {len(surveillance_state.current_session_stats['unique_individuals'])}")
+        
         # Add HUD overlay
         processed = self.add_hud_overlay(processed, len(faces), timestamp)
         
@@ -573,7 +672,12 @@ video_processor = VideoProcessor(source=0, camera_id="CAM-001", location="Main E
 
 async def generate_frames():
     """Stream generator with FPS tracking"""
-    video_processor.start()
+    # Start video processor only if not already running
+    if not video_processor.running:
+        if not video_processor.start():
+            print("❌ Failed to start video processor")
+            return
+    
     frame_times = deque(maxlen=30)
     
     while video_processor.running:
@@ -581,7 +685,9 @@ async def generate_frames():
         
         success, frame = video_processor.cap.read()
         if not success:
-            break
+            print("⚠️ Failed to read frame from camera")
+            await asyncio.sleep(0.1)
+            continue
         
         # Process frame
         processed_frame, detections = video_processor.process_frame(frame)
@@ -615,6 +721,16 @@ async def broadcast_detections(detections):
     if surveillance_state.active_connections:
         message = json.dumps({"type": "detection", "data": detections})
         
+        # Check for high-risk alerts
+        high_risk = [d for d in detections if d.get('risk_level') == 'HIGH']
+        if high_risk:
+            alert_message = json.dumps({
+                "type": "alert",
+                "severity": "high",
+                "data": high_risk
+            })
+            await broadcast_message(alert_message)
+        
         disconnected = []
         for conn in surveillance_state.active_connections:
             try:
@@ -624,6 +740,19 @@ async def broadcast_detections(detections):
         
         for conn in disconnected:
             surveillance_state.active_connections.remove(conn)
+
+
+async def broadcast_message(message):
+    """Send message to all connected WebSocket clients"""
+    disconnected = []
+    for conn in surveillance_state.active_connections:
+        try:
+            await conn.send_text(message)
+        except:
+            disconnected.append(conn)
+    
+    for conn in disconnected:
+        surveillance_state.active_connections.remove(conn)
 
 
 # ============= API ENDPOINTS =============
@@ -815,6 +944,157 @@ async def export_log():
             "total_detections": len(surveillance_state.detections),
             "detections": list(surveillance_state.detections)
         }
+
+
+# ============= VIDEO SOURCE MANAGEMENT =============
+
+@app.post("/api/video/upload")
+async def upload_video(file: UploadFile = File(...)):
+    """
+    Upload video file for processing
+    Supports: MP4, AVI, MOV, MKV, FLV, WMV
+    """
+    print(f"\n📹 Video upload received: {file.filename}")
+    
+    # Validate file format
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in Config.SUPPORTED_VIDEO_FORMATS:
+        return {
+            "success": False,
+            "error": f"Unsupported format. Supported: {', '.join(Config.SUPPORTED_VIDEO_FORMATS)}"
+        }
+    
+    try:
+        # Save uploaded file
+        timestamp = int(time.time() * 1000)
+        filename = f"video_{timestamp}{file_ext}"
+        file_path = Config.VIDEO_UPLOADS_DIR / filename
+        
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        
+        print(f"✅ Video saved: {file_path}")
+        print(f"   Size: {len(contents) / (1024*1024):.2f} MB")
+        
+        return {
+            "success": True,
+            "filename": filename,
+            "filepath": str(file_path),
+            "size_mb": len(contents) / (1024*1024)
+        }
+    except Exception as e:
+        print(f"❌ Video upload error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/video/set-source")
+async def set_video_source(
+    source_type: str = Form(...),  # webcam, file, rtsp
+    source_path: str = Form(None),  # file path or RTSP URL
+    camera_id: str = Form("CAM-001"),
+    location: str = Form("Unknown")
+):
+    """
+    Switch video source
+    - webcam: Use laptop camera (source_path not needed)
+    - file: Process uploaded video file (source_path = filename)
+    - rtsp: Connect to IP camera/stream (source_path = rtsp://...)
+    """
+    global video_processor
+    
+    print(f"\n🔄 Switching video source:")
+    print(f"   Type: {source_type}")
+    print(f"   Path: {source_path}")
+    print(f"   Camera ID: {camera_id}")
+    print(f"   Location: {location}")
+    
+    try:
+        # Stop current processor
+        if video_processor and video_processor.running:
+            video_processor.stop()
+            print("   ✅ Stopped previous video source")
+        
+        # Determine source
+        if source_type == "webcam":
+            source = 0
+        elif source_type == "file":
+            if not source_path:
+                return {"success": False, "error": "File path required for file source"}
+            source = str(Config.VIDEO_UPLOADS_DIR / source_path)
+            if not Path(source).exists():
+                return {"success": False, "error": f"Video file not found: {source_path}"}
+        elif source_type == "rtsp":
+            if not source_path:
+                return {"success": False, "error": "RTSP URL required"}
+            source = source_path
+        else:
+            return {"success": False, "error": f"Unknown source type: {source_type}"}
+        
+        # Create new processor
+        video_processor = VideoProcessor(
+            source=source,
+            camera_id=camera_id,
+            location=location,
+            source_type=source_type
+        )
+        
+        # Update global state
+        with surveillance_state.lock:
+            surveillance_state.video_source_type = source_type
+            surveillance_state.video_source_path = source_path
+            surveillance_state.detections.clear()  # Clear previous detections
+        
+        success = video_processor.start()
+        
+        if not success:
+            return {"success": False, "error": "Failed to start video source"}
+        
+        print("   ✅ Video source switched successfully")
+        
+        return {
+            "success": True,
+            "source_type": source_type,
+            "source_path": source_path,
+            "camera_id": camera_id,
+            "location": location,
+            "total_frames": video_processor.total_frames if source_type == "file" else None
+        }
+        
+    except Exception as e:
+        print(f"❌ Error switching video source: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/video/progress")
+async def get_video_progress():
+    """
+    Get current video processing progress
+    For video files, returns frame count and completion percentage
+    """
+    with surveillance_state.lock:
+        return {
+            "source_type": surveillance_state.video_source_type,
+            "current_frame": surveillance_state.video_current_frame,
+            "total_frames": surveillance_state.video_total_frames,
+            "progress_percentage": (
+                (surveillance_state.video_current_frame / surveillance_state.video_total_frames * 100)
+                if surveillance_state.video_total_frames > 0 else 0
+            ),
+            "processing_complete": surveillance_state.video_processing_complete
+        }
+
+
+@app.get("/api/video/session-stats")
+async def get_session_stats():
+    """
+    Get current session statistics
+    Shows aggregated stats for the current video source
+    """
+    with surveillance_state.lock:
+        stats = surveillance_state.current_session_stats.copy()
+        stats['unique_individuals'] = len(stats['unique_individuals'])
+        return stats
 
 
 @app.get("/api/stats")
