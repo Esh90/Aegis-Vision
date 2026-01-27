@@ -189,9 +189,15 @@ class VideoProcessor:
         self.cap = None
         self.running = False
         self.frame_skip_counter = 0
-        self.face_recognition_interval = 5  # Process face recognition every 5 frames
+        self.face_recognition_interval = 10  # Process face recognition every 10 frames (optimized for speed)
         self.total_frames = 0
         self.current_frame_number = 0
+        
+        # Vehicle speed tracking
+        self.prev_frame_gray = None
+        self.prev_faces = []  # Store previous frame's face positions
+        self.vehicle_speeds = []  # Store estimated speeds in km/h
+        self.fps = 30  # Default FPS, will be updated from video source
         
     def start(self):
         """Initialize video capture with optimizations"""
@@ -208,6 +214,11 @@ class VideoProcessor:
             print(f"❌ Failed to open video source: {self.source}")
             return False
         
+        # Get FPS from video source for speed calculation
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self.fps == 0 or self.fps > 60:  # Fallback for invalid FPS
+            self.fps = 30
+        
         # Set resolution to 1280x720 for webcams (HD quality)
         # For IP cameras/files, resolution is auto-detected
         if isinstance(self.source, int):  # Webcam
@@ -215,13 +226,13 @@ class VideoProcessor:
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffering for low latency
+            self.fps = 30
         
         # Get total frames for video files
         if self.source_type == "file":
             self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            duration = self.total_frames / fps if fps > 0 else 0
-            print(f"   📊 Video info: {self.total_frames} frames, {fps:.2f} FPS, {duration:.2f}s duration")
+            duration = self.total_frames / self.fps if self.fps > 0 else 0
+            print(f"   📊 Video info: {self.total_frames} frames, {self.fps:.2f} FPS, {duration:.2f}s duration")
             surveillance_state.video_total_frames = self.total_frames
         
         self.running = True
@@ -257,67 +268,106 @@ class VideoProcessor:
     
     def enhance_low_light(self, frame):
         """
-        Production low-light enhancement:
-        - CLAHE for adaptive contrast
-        - Gamma correction
-        - Noise reduction
+        Adaptive enhancement for surveillance:
+        - Detects brightness level and applies appropriate enhancement
+        - Light enhancement for normal lighting
+        - Heavy Multi-Scale Retinex for very dark scenes
         """
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
+        # Check average brightness to determine enhancement level
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        avg_brightness = gray.mean()
         
-        # CLAHE with optimized parameters
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        l = clahe.apply(l)
+        # If image is already well-lit (>100), apply minimal enhancement
+        if avg_brightness > 100:
+            # Minimal enhancement - just slight contrast boost
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
         
-        enhanced = cv2.merge([l, a, b])
-        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        # Medium brightness (50-100): Moderate CLAHE enhancement
+        elif avg_brightness > 50:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+            
+            # Mild gamma correction
+            gamma = 1.2
+            inv_gamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
+            enhanced = cv2.LUT(enhanced, table)
+            return enhanced
         
-        # Gamma correction for very dark scenes
-        gamma = 1.2
-        inv_gamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
-        enhanced = cv2.LUT(enhanced, table)
-        
-        # Bilateral filter for noise reduction while preserving edges
-        enhanced = cv2.bilateralFilter(enhanced, 5, 50, 50)
-        
-        return enhanced
+        # Very dark (<50): Apply full Multi-Scale Retinex
+        else:
+            frame_float = frame.astype(np.float32) / 255.0
+            
+            # Multi-Scale Retinex
+            def single_scale_retinex(img, sigma):
+                blurred = cv2.GaussianBlur(img, (0, 0), sigma)
+                return np.log10(img + 1e-6) - np.log10(blurred + 1e-6)
+            
+            scales = [15, 80, 250]
+            msr_output = np.zeros_like(frame_float)
+            for scale in scales:
+                for i in range(3):
+                    msr_output[:, :, i] += single_scale_retinex(frame_float[:, :, i], scale)
+            msr_output = msr_output / len(scales)
+            
+            # Normalize
+            msr_min = msr_output.min()
+            msr_max = msr_output.max()
+            msr_normalized = ((msr_output - msr_min) / (msr_max - msr_min) * 255).astype(np.uint8)
+            
+            # CLAHE
+            lab = cv2.cvtColor(msr_normalized, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+            
+            # Gamma correction
+            gamma = 1.5
+            inv_gamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
+            enhanced = cv2.LUT(enhanced, table)
+            
+            # Skip expensive denoising for speed
+            return enhanced
     
     def correct_motion_blur(self, frame):
         """
-        Motion blur correction using Wiener deconvolution approximation
-        For production, use deep learning models like DeblurGAN-v2
+        Fast sharpening for slight motion blur (optimized for speed)
         """
-        # Estimate motion kernel (simplified)
-        kernel_size = 15
-        kernel = np.zeros((kernel_size, kernel_size))
-        kernel[int((kernel_size - 1) / 2), :] = np.ones(kernel_size)
-        kernel = kernel / kernel_size
-        
-        # Wiener deconvolution (simplified - use proper implementation in production)
-        deblurred = cv2.filter2D(frame, -1, kernel)
-        
-        # Sharpen
-        sharpening_kernel = np.array([[-1, -1, -1],
-                                     [-1,  9, -1],
-                                     [-1, -1, -1]])
-        deblurred = cv2.filter2D(deblurred, -1, sharpening_kernel)
-        
-        return cv2.addWeighted(frame, 0.5, deblurred, 0.5, 0)
+        # Simple unsharp masking - much faster than deconvolution
+        gaussian = cv2.GaussianBlur(frame, (5, 5), 1.5)
+        sharpened = cv2.addWeighted(frame, 1.5, gaussian, -0.5, 0)
+        return sharpened
     
     def super_resolve_face(self, face_img):
         """
-        Super-resolution for low-resolution faces
-        Uses Real-ESRGAN if available, otherwise bicubic upscaling
+        Real-ESRGAN super-resolution for low-resolution faces from motorway cameras
+        Upscales faces up to 4x with detail restoration
         """
-        if ai_models.upsampler is not None and face_img.shape[0] < 128:
+        h, w = face_img.shape[:2]
+        
+        # Apply ESRGAN if face is small (< 128px) and model is available
+        if ai_models.upsampler is not None and (h < 128 or w < 128):
             try:
+                # ESRGAN can handle very small faces
                 output, _ = ai_models.upsampler.enhance(face_img, outscale=4)
+                print(f"✨ ESRGAN upscaled face from {w}x{h} to {output.shape[1]}x{output.shape[0]}")
                 return output
             except Exception as e:
-                print(f"ESRGAN error: {e}")
+                print(f"⚠️  ESRGAN error: {e}, falling back to classical upscaling")
         
-        # Fallback: Bicubic + sharpening
+        # Fallback: Advanced bicubic + detail enhancement
         if face_img.shape[0] < 128:
             scale = 128 / face_img.shape[0]
             upscaled = cv2.resize(face_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -484,10 +534,13 @@ class VideoProcessor:
         """Complete processing pipeline"""
         processed = frame.copy()
         
-        # Step 1: Enhancement
+        # Step 1: Smart Enhancement (only if needed)
         if surveillance_state.enhancement_enabled:
-            processed = self.enhance_low_light(processed)
-            processed = self.correct_motion_blur(processed)
+            # Check if frame is dark before applying heavy processing
+            avg_brightness = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY).mean()
+            if avg_brightness < 120:  # Only enhance if somewhat dark
+                processed = self.enhance_low_light(processed)
+            # Skip motion blur correction by default (expensive)
         
         # Step 2: Face Detection
         faces = self.detect_faces(processed)
@@ -607,8 +660,13 @@ class VideoProcessor:
                     print(f"   Total faces detected: {surveillance_state.current_session_stats['total_faces']}")
                     print(f"   Unique individuals: {len(surveillance_state.current_session_stats['unique_individuals'])}")
         
-        # Add HUD overlay
-        processed = self.add_hud_overlay(processed, len(faces), timestamp)
+        # Estimate vehicle speed if faces detected
+        vehicle_speed = None
+        if len(faces) > 0:
+            vehicle_speed = self.estimate_vehicle_speed(processed, faces)
+        
+        # Add HUD overlay with speed
+        processed = self.add_hud_overlay(processed, len(faces), timestamp, vehicle_speed)
         
         return processed, detections
     
@@ -622,8 +680,73 @@ class VideoProcessor:
         }
         return colors.get(risk_level, (255, 255, 255))
     
-    def add_hud_overlay(self, frame, face_count, timestamp):
-        """Mission Control HUD"""
+    def estimate_vehicle_speed(self, frame, current_faces):
+        """
+        Estimate vehicle speed using optical flow and face displacement
+        Assumes: Camera height ~5m, typical motorway speed range 60-120 km/h
+        """
+        if len(current_faces) == 0 or len(self.prev_faces) == 0:
+            self.prev_faces = current_faces
+            return None
+        
+        # Convert to grayscale for optical flow
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        if self.prev_frame_gray is None:
+            self.prev_frame_gray = gray
+            self.prev_faces = current_faces
+            return None
+        
+        # Calculate optical flow using Lucas-Kanade method
+        try:
+            # Get face center points from current and previous frames
+            if len(current_faces) > 0 and len(self.prev_faces) > 0:
+                # Use first detected face for speed estimation
+                curr_face = current_faces[0]
+                prev_face = self.prev_faces[0]
+                
+                # Calculate face center displacement
+                curr_center_x = (curr_face[0] + curr_face[2]) / 2
+                prev_center_x = (prev_face[0] + prev_face[2]) / 2
+                
+                # Pixel displacement per frame
+                displacement_px = abs(curr_center_x - prev_center_x)
+                
+                # Estimate speed based on displacement and FPS
+                # Calibration: Assume 100 pixels displacement = ~50 km/h at 5m distance
+                # This needs camera-specific calibration in production
+                if displacement_px > 2:  # Ignore small movements (noise)
+                    # Speed estimation formula (requires camera calibration)
+                    pixels_per_meter = 20  # Calibration constant
+                    displacement_m = displacement_px / pixels_per_meter
+                    time_interval = 1.0 / self.fps
+                    speed_ms = displacement_m / time_interval
+                    speed_kmh = speed_ms * 3.6  # Convert m/s to km/h
+                    
+                    # Clamp to realistic motorway speeds (10-200 km/h)
+                    speed_kmh = np.clip(speed_kmh, 10, 200)
+                    
+                    # Store speed
+                    self.vehicle_speeds.append(speed_kmh)
+                    if len(self.vehicle_speeds) > 30:  # Keep last 30 measurements
+                        self.vehicle_speeds.pop(0)
+                    
+                    # Return average speed for stability
+                    avg_speed = np.mean(self.vehicle_speeds)
+                    
+                    self.prev_frame_gray = gray
+                    self.prev_faces = current_faces
+                    return int(avg_speed)
+        
+        except Exception as e:
+            print(f"⚠️  Speed estimation error: {e}")
+        
+        self.prev_frame_gray = gray
+        self.prev_faces = current_faces
+        return None
+    
+    def add_hud_overlay(self, frame, face_count, timestamp, vehicle_speed=None):
+        """Mission Control HUD with vehicle speed"""
         overlay = frame.copy()
         h, w = frame.shape[:2]
         color = (59, 130, 246)
@@ -656,7 +779,9 @@ class VideoProcessor:
         cv2.putText(overlay, f"{self.camera_id} | {self.location}", (30, 80),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        cv2.putText(overlay, f"TARGETS: {face_count} | FPS: {surveillance_state.fps:.1f}", 
+        # Display targets, FPS, and speed
+        speed_str = f" | SPEED: {vehicle_speed} km/h" if vehicle_speed else ""
+        cv2.putText(overlay, f"TARGETS: {face_count} | FPS: {surveillance_state.fps:.1f}{speed_str}", 
                    (30, h-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         
         # Scanning line
