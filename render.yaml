@@ -1,0 +1,25 @@
+services:
+  # Backend API Service
+  - type: web
+    name: aegis-vision-backend
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: CONFIDENCE_THRESHOLD
+        value: 0.4
+      - key: CAMERA_INDEX
+        value: 0
+    healthCheckPath: /
+    
+  # Frontend Service
+  - type: web
+    name: aegis-vision-frontend
+    runtime: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
+    envVars:
+      - key: NODE_VERSION
+        value: 18.19.0

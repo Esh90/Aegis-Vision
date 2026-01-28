@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { 
   Camera, Shield, Activity, AlertTriangle, Download, Eye, EyeOff,
   Video, Upload, Radio, X, CheckCircle, Loader2, FileVideo, Bell, BellOff, 
-  BarChart3, Play, RefreshCw
+  BarChart3, Play, RefreshCw, Square
 } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000/api';
@@ -89,14 +89,20 @@ export default function AegisVisionDashboard() {
   const [enhancementEnabled, setEnhancementEnabled] = useState(true);
   const [scanLine, setScanLine] = useState(0);
   const [showWatchlistModal, setShowWatchlistModal] = useState(false);
+  const [showBulkUploadModal, setShowBulkUploadModal] = useState(false);
   const [uploadStatus, setUploadStatus] = useState('');
+  const [bulkUploadStatus, setBulkUploadStatus] = useState('');
   
   // New state for multi-source video
-  const [videoSource, setVideoSource] = useState<{ type: 'webcam' | 'file' | 'rtsp'; path?: string }>({ type: 'webcam' });
+  const [videoSource, setVideoSource] = useState<{ type: 'webcam' | 'file' | 'rtsp'; path?: string; cameraIndex?: number }>({ type: 'webcam', cameraIndex: 0 });
   const [videoProgress, setVideoProgress] = useState<VideoProgress | null>(null);
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null);
   const [showSessionStats, setShowSessionStats] = useState(false);
   const [uploadedFile, setUploadedFile] = useState<string | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [selectedCamera, setSelectedCamera] = useState(0);
+  const [droidcamIp, setDroidcamIp] = useState(import.meta.env.VITE_DROIDCAM_IP || '');
+  const [droidcamPort, setDroidcamPort] = useState(import.meta.env.VITE_DROIDCAM_PORT || '4747');
   
   // Alert system
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -113,11 +119,23 @@ export default function AegisVisionDashboard() {
   const progressIntervalRef = useRef<number | null>(null);
 
   // WebSocket connection for real-time detections
-  useEffect(() => {
+  const connectWebSocket = () => {
+    // Close existing connection if any
+    if (wsRef.current) {
+      if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
+        wsRef.current.close();
+      }
+      wsRef.current = null;
+    }
+
+    console.log('🔷 Connecting WebSocket...');
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
 
-    ws.onopen = () => console.log('🔷 WebSocket connected');
+    ws.onopen = () => {
+      console.log('🔷 WebSocket connected');
+      setIsStreaming(true);
+    };
     
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data);
@@ -127,7 +145,6 @@ export default function AegisVisionDashboard() {
       } else if (message.type === 'detection') {
         setDetections(prev => [...message.data.reverse(), ...prev].slice(0, 20));
       } else if (message.type === 'alert') {
-        // Handle high-risk alerts
         handleNewAlert({
           id: Date.now().toString(),
           severity: message.severity,
@@ -137,10 +154,28 @@ export default function AegisVisionDashboard() {
       }
     };
 
-    ws.onerror = (error) => console.error('WebSocket error:', error);
-    ws.onclose = () => console.log('🔷 WebSocket disconnected');
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setIsStreaming(false);
+    };
+    
+    ws.onclose = () => {
+      console.log('🔷 WebSocket disconnected');
+      setIsStreaming(false);
+    };
+  };
 
-    return () => ws.close();
+  const disconnectWebSocket = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      disconnectWebSocket();
+    };
   }, []);
 
   // Fetch stats periodically
@@ -342,6 +377,53 @@ export default function AegisVisionDashboard() {
     }
   };
 
+  const startCamera = async (cameraIndex: number) => {
+    try {
+      console.log(`Starting camera ${cameraIndex}...`);
+      
+      // First stop any existing stream
+      if (isStreaming) {
+        await stopCamera();
+        // Wait a bit for cleanup
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+      
+      const response = await fetch(`${API_BASE}/start-webcam/${cameraIndex}`, { method: 'POST' });
+      const data = await response.json();
+      
+      if (data.success) {
+        console.log('Camera started, connecting WebSocket...');
+        setVideoSource({ type: 'webcam', cameraIndex });
+        setActiveTab('webcam');
+        
+        // Connect WebSocket after a short delay to ensure backend is ready
+        setTimeout(() => {
+          connectWebSocket();
+        }, 200);
+      } else {
+        alert(`Failed to start camera: ${data.error}`);
+        setIsStreaming(false);
+      }
+    } catch (error) {
+      alert(`Error starting camera: ${error}`);
+      setIsStreaming(false);
+    }
+  };
+
+  const stopCamera = async () => {
+    try {
+      console.log('Stopping camera...');
+      disconnectWebSocket();
+      await fetch(`${API_BASE}/stop-stream`, { method: 'POST' });
+      setIsStreaming(false);
+      setDetections([]);
+      console.log('Camera stopped');
+    } catch (error) {
+      console.error('Error stopping camera:', error);
+      setIsStreaming(false);
+    }
+  };
+
   const handleAddToWatchlist = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
@@ -365,6 +447,30 @@ export default function AegisVisionDashboard() {
       }
     } catch (err) {
       setUploadStatus(`❌ Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
+
+  const handleBulkUpload = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setBulkUploadStatus('Processing bulk upload...');
+    try {
+      const formData = new FormData(e.currentTarget);
+      const res = await fetch(`${API_BASE}/watchlist/bulk-upload`, {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      if (data.success) {
+        setBulkUploadStatus(`✅ Processed: ${data.processed}/${data.total} (Failed: ${data.failed})`);
+        setTimeout(() => {
+          setShowBulkUploadModal(false);
+          setBulkUploadStatus('');
+        }, 3000);
+      } else {
+        setBulkUploadStatus(`❌ Error: ${data.error}`);
+      }
+    } catch (error) {
+      setBulkUploadStatus(`❌ Upload failed: ${error}`);
     }
   };
 
@@ -496,19 +602,93 @@ export default function AegisVisionDashboard() {
               className="min-h-30"
             >
               {activeTab === 'webcam' && (
-                <div className="flex flex-col items-center justify-center py-6">
-                  <Camera className="w-12 h-12 text-blue-400 mb-3" />
-                  <button
-                    onClick={() => switchVideoSource('webcam')}
-                    disabled={videoSource.type === 'webcam'}
-                    className={`px-6 py-2 rounded font-semibold transition-all ${
-                      videoSource.type === 'webcam'
-                        ? 'bg-green-500/20 text-green-400 border-2 border-green-500'
-                        : 'bg-blue-500 hover:bg-blue-600 text-white'
-                    }`}
-                  >
-                    {videoSource.type === 'webcam' ? '✓ Webcam Active' : 'Start Webcam'}
-                  </button>
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm text-gray-400 mb-2 font-semibold">Select Camera</label>
+                    <select
+                      value={selectedCamera}
+                      onChange={(e) => setSelectedCamera(Number(e.target.value))}
+                      disabled={isStreaming}
+                      className="w-full bg-slate-800 border border-blue-500/30 rounded px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                      title="Select camera source"
+                      aria-label="Select camera source"
+                    >
+                      <option value={0}>Camera 0 - Laptop Webcam</option>
+                      <option value={1}>Camera 1 - External USB Camera</option>
+                      <option value={-1}>📱 DroidCam WiFi - Enter IP Below ⬇️</option>
+                    </select>
+                  </div>
+                  
+                  {selectedCamera === -1 && (
+                    <div className="space-y-3 p-3 bg-slate-800/50 rounded border border-purple-500/30">
+                      <p className="text-xs text-purple-400 font-semibold">📱 DroidCam WiFi Settings</p>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="col-span-2">
+                          <label className="block text-xs text-gray-400 mb-1">Phone IP Address</label>
+                          <input
+                            type="text"
+                            value={droidcamIp}
+                            onChange={(e) => setDroidcamIp(e.target.value)}
+                            placeholder="192.168.1.5"
+                            disabled={isStreaming}
+                            className="w-full bg-slate-700 border border-purple-500/30 rounded px-3 py-2 text-sm disabled:opacity-50"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-gray-400 mb-1">Port</label>
+                          <input
+                            type="text"
+                            value={droidcamPort}
+                            onChange={(e) => setDroidcamPort(e.target.value)}
+                            placeholder="4747"
+                            disabled={isStreaming}
+                            className="w-full bg-slate-700 border border-purple-500/30 rounded px-3 py-2 text-sm disabled:opacity-50"
+                          />
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-500">💡 Open DroidCam app → Enable "WiFi" → Note IP:Port</p>
+                    </div>
+                  )}
+                  
+                  <div className="flex gap-3">
+                    {!isStreaming ? (
+                      <button
+                        onClick={() => {
+                          if (selectedCamera === -1) {
+                            if (!droidcamIp) {
+                              alert('Please enter DroidCam IP address');
+                              return;
+                            }
+                            const droidcamUrl = `http://${droidcamIp}:${droidcamPort}/video`;
+                            switchVideoSource('rtsp', droidcamUrl);
+                          } else {
+                            startCamera(selectedCamera);
+                          }
+                        }}
+                        className="flex-1 px-6 py-3 bg-green-600 hover:bg-green-700 rounded font-semibold transition-all flex items-center justify-center gap-2"
+                      >
+                        <Play className="w-5 h-5" />
+                        {selectedCamera === -1 ? 'Connect DroidCam' : 'Start Camera'}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={stopCamera}
+                        className="flex-1 px-6 py-3 bg-red-600 hover:bg-red-700 rounded font-semibold transition-all flex items-center justify-center gap-2"
+                      >
+                        <Square className="w-5 h-5" />
+                        Stop Camera
+                      </button>
+                    )}
+                  </div>
+                  
+                  {isStreaming && (
+                    <div className="flex items-center gap-2 text-green-400 text-sm justify-center">
+                      <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+                      <span className="font-semibold">
+                        {selectedCamera === -1 ? 'DroidCam' : `Camera ${selectedCamera}`} streaming
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -663,7 +843,7 @@ export default function AegisVisionDashboard() {
             </div>
 
             {/* Control Panel */}
-            <div className="mt-4 grid grid-cols-3 gap-4">
+            <div className="mt-4 grid grid-cols-4 gap-3">
               <button
                 onClick={toggleEnhancement}
                 className="bg-slate-800 hover:bg-slate-700 border border-blue-500/30 rounded-lg px-4 py-3 flex items-center justify-center gap-2 transition-all hover:border-blue-500 text-white"
@@ -687,11 +867,21 @@ export default function AegisVisionDashboard() {
               <button 
                 onClick={() => setShowWatchlistModal(true)}
                 className="bg-slate-800 hover:bg-slate-700 border border-blue-500/30 rounded-lg px-4 py-3 flex items-center justify-center gap-2 transition-all hover:border-blue-500 text-white"
-                title="Add person to watchlist"
-                aria-label="Add person to watchlist"
+                title="Add single person to watchlist"
+                aria-label="Add single person to watchlist"
               >
                 <Shield className="w-5 h-5 text-orange-400" />
-                <span className="text-sm">Add Watchlist</span>
+                <span className="text-sm">Add Single</span>
+              </button>
+              
+              <button 
+                onClick={() => setShowBulkUploadModal(true)}
+                className="bg-slate-800 hover:bg-slate-700 border border-purple-500/30 rounded-lg px-4 py-3 flex items-center justify-center gap-2 transition-all hover:border-purple-500 text-white"
+                title="Bulk upload from Excel + ZIP"
+                aria-label="Bulk upload watchlist"
+              >
+                <Upload className="w-5 h-5 text-purple-400" />
+                <span className="text-sm">Bulk Upload</span>
               </button>
             </div>
           </div>
@@ -869,6 +1059,97 @@ export default function AegisVisionDashboard() {
         )}
       </AnimatePresence>
 
+      {/* Bulk Upload Modal */}
+      <AnimatePresence>
+        {showBulkUploadModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50"
+            onClick={() => setShowBulkUploadModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-slate-900 border border-purple-500/30 rounded-lg p-6 w-full max-w-lg"
+            >
+              <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
+                <Upload className="w-6 h-6 text-purple-500" />
+                Bulk Upload Watchlist
+              </h2>
+              
+              <div className="mb-4 p-3 bg-slate-800 rounded text-sm">
+                <p className="text-blue-400 font-semibold mb-2">📋 Requirements:</p>
+                <ul className="space-y-1 text-slate-300 text-xs">
+                  <li>• <strong>Excel/CSV</strong> with columns: name, image_filename, risk_level, notes</li>
+                  <li>• <strong>ZIP file</strong> containing all images referenced in Excel</li>
+                  <li>• Image filenames must match Excel entries</li>
+                </ul>
+              </div>
+              
+              <form onSubmit={handleBulkUpload} className="space-y-4">
+                <div>
+                  <label className="block text-sm mb-2">Excel/CSV File</label>
+                  <input
+                    type="file"
+                    name="excel_file"
+                    accept=".xlsx,.xls,.csv"
+                    required
+                    title="Upload Excel or CSV file"
+                    className="w-full bg-slate-800 border border-purple-500/30 rounded px-3 py-2 text-sm"
+                  />
+                </div>
+                
+                <div>
+                  <label className="block text-sm mb-2">Images ZIP File</label>
+                  <input
+                    type="file"
+                    name="images_zip"
+                    accept=".zip"
+                    required
+                    title="Upload ZIP file with images"
+                    className="w-full bg-slate-800 border border-purple-500/30 rounded px-3 py-2 text-sm"
+                  />
+                </div>
+                
+                {bulkUploadStatus && (
+                  <div className="text-sm text-center py-2 rounded bg-slate-800">
+                    {bulkUploadStatus}
+                  </div>
+                )}
+                
+                <div className="flex gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setShowBulkUploadModal(false)}
+                    className="flex-1 bg-slate-800 hover:bg-slate-700 border border-purple-500/30 rounded px-4 py-2 text-sm transition-all"
+                    title="Cancel and close modal"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="flex-1 bg-purple-600 hover:bg-purple-700 rounded px-4 py-2 text-sm transition-all"
+                    title="Upload bulk watchlist"
+                  >
+                    Upload Bulk
+                  </button>
+                </div>
+              </form>
+              
+              <div className="mt-4 pt-4 border-t border-slate-700">
+                <p className="text-xs text-blue-400">
+                  📖 See <strong>BULK_UPLOAD_GUIDE.md</strong> for template & instructions
+                </p>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Session Stats Modal */}
       <AnimatePresence>
         {showSessionStats && sessionStats && (
@@ -948,7 +1229,7 @@ export default function AegisVisionDashboard() {
                   onClick={() => {
                     setShowSessionStats(false);
                     setVideoProgress(null);
-                    switchVideoSource('webcam');
+                    setActiveTab('webcam');
                   }}
                   className="flex-1 bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded flex items-center justify-center gap-2 transition-all"
                   title="Start new session"

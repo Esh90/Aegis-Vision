@@ -17,6 +17,9 @@ from collections import deque
 import threading
 import time
 from pathlib import Path
+import zipfile
+import io
+import pandas as pd
 
 # AI/ML Imports
 try:
@@ -206,7 +209,22 @@ class VideoProcessor:
         
         # Use DirectShow backend for Windows webcams (much faster)
         if isinstance(self.source, int):
-            self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+            # For laptop camera (0), use DirectShow
+            if self.source == 0:
+                self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+            else:
+                # For external cameras, try multiple backends
+                print(f"   Trying multiple backends for camera {self.source}...")
+                
+                # Try DirectShow first
+                self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+                if not self.cap.isOpened():
+                    print("   DirectShow failed, trying default backend...")
+                    self.cap = cv2.VideoCapture(self.source)
+                
+                if not self.cap.isOpened():
+                    print("   Default failed, trying MSMF backend...")
+                    self.cap = cv2.VideoCapture(self.source, cv2.CAP_MSMF)
         else:
             self.cap = cv2.VideoCapture(self.source)
         
@@ -793,6 +811,51 @@ class VideoProcessor:
 
 # Global processor
 video_processor = VideoProcessor(source=0, camera_id="CAM-001", location="Main Entrance")
+# Don't auto-start - wait for user to click start button
+frame_processing_task = None
+
+
+async def process_frames_background():
+    """Background task to continuously process frames"""
+    global video_processor
+    
+    while video_processor.running:
+        try:
+            success, frame = video_processor.cap.read()
+            if not success:
+                print("⚠️ Failed to read frame from camera")
+                await asyncio.sleep(0.1)
+                continue
+            
+            # Process frame
+            processed_frame, detections = video_processor.process_frame(frame)
+            
+            # Store detections
+            with surveillance_state.lock:
+                for det in detections:
+                    surveillance_state.detections.append(det)
+            
+            # Broadcast to WebSocket clients
+            if detections and surveillance_state.active_connections:
+                message = json.dumps({"type": "detection", "data": detections})
+                
+                # Check for high-risk alerts
+                high_risk = [d for d in detections if d.get('risk_level') == 'HIGH']
+                if high_risk:
+                    alert_message = json.dumps({
+                        "type": "alert",
+                        "severity": "high",
+                        "data": high_risk
+                    })
+                    await broadcast_message(alert_message)
+                
+                await broadcast_message(message)
+            
+            await asyncio.sleep(0.001)  # Small delay to prevent CPU overload
+            
+        except Exception as e:
+            print(f"❌ Error in frame processing: {e}")
+            await asyncio.sleep(0.1)
 
 
 async def generate_frames():
@@ -1046,6 +1109,224 @@ async def remove_from_watchlist(person_id: str):
     return {"success": False, "error": "Person not found"}
 
 
+@app.post("/api/watchlist/bulk-upload")
+async def bulk_upload_watchlist(
+    excel_file: UploadFile = File(...),
+    images_zip: UploadFile = File(...)
+):
+    """
+    Bulk upload watchlist from Excel + ZIP of images
+    
+    Excel format:
+    - name (required)
+    - risk_level (optional: LOW/MEDIUM/HIGH)
+    - notes (optional)
+    - image_filename (required - must match file in ZIP)
+    
+    Returns summary of successful/failed uploads
+    """
+    print(f"\n📦 BULK UPLOAD started")
+    print(f"   Excel: {excel_file.filename}")
+    print(f"   ZIP: {images_zip.filename}")
+    
+    results = {
+        "success": True,
+        "total": 0,
+        "processed": 0,
+        "failed": 0,
+        "entries": []
+    }
+    
+    try:
+        # Step 1: Read Excel file
+        excel_content = await excel_file.read()
+        
+        try:
+            # Try reading as Excel
+            df = pd.read_excel(io.BytesIO(excel_content))
+        except:
+            try:
+                # Fallback to CSV
+                df = pd.read_csv(io.BytesIO(excel_content))
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Failed to parse Excel/CSV: {str(e)}. Expected columns: name, image_filename, risk_level (optional), notes (optional)"
+                }
+        
+        # Validate required columns
+        required_cols = ['name', 'image_filename']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            return {
+                "success": False,
+                "error": f"Missing required columns: {', '.join(missing_cols)}. Found columns: {', '.join(df.columns)}"
+            }
+        
+        print(f"   ✅ Parsed {len(df)} entries from Excel")
+        results["total"] = len(df)
+        
+        # Step 2: Read ZIP file with images
+        zip_content = await images_zip.read()
+        
+        try:
+            zip_file = zipfile.ZipFile(io.BytesIO(zip_content))
+            image_files = {name: zip_file.read(name) for name in zip_file.namelist() 
+                          if name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))}
+            print(f"   ✅ Found {len(image_files)} images in ZIP")
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to read ZIP file: {str(e)}"
+            }
+        
+        # Step 3: Process each entry
+        for idx, row in df.iterrows():
+            entry_result = {
+                "index": idx + 1,
+                "name": row['name'],
+                "image_filename": row['image_filename'],
+                "success": False,
+                "error": None,
+                "person_id": None
+            }
+            
+            try:
+                # Get values with defaults
+                name = str(row['name'])
+                image_filename = str(row['image_filename'])
+                risk_level = str(row.get('risk_level', 'LOW')).upper()
+                notes = str(row.get('notes', ''))
+                
+                # Validate risk level
+                if risk_level not in ['LOW', 'MEDIUM', 'HIGH']:
+                    risk_level = 'LOW'
+                
+                # Find image in ZIP (case-insensitive)
+                image_data = None
+                for zip_name, zip_data in image_files.items():
+                    if zip_name.lower().endswith(image_filename.lower()) or \
+                       Path(zip_name).name.lower() == image_filename.lower():
+                        image_data = zip_data
+                        break
+                
+                if image_data is None:
+                    entry_result["error"] = f"Image not found in ZIP: {image_filename}"
+                    results["failed"] += 1
+                    results["entries"].append(entry_result)
+                    continue
+                
+                # Decode image
+                nparr = np.frombuffer(image_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img is None:
+                    entry_result["error"] = "Failed to decode image"
+                    results["failed"] += 1
+                    results["entries"].append(entry_result)
+                    continue
+                
+                # Apply same preprocessing as single upload
+                if surveillance_state.enhancement_enabled:
+                    img = video_processor.enhance_low_light(img)
+                    img = video_processor.correct_motion_blur(img)
+                
+                # Detect face
+                faces = video_processor.detect_faces(img)
+                
+                if not faces or len(faces) == 0:
+                    entry_result["error"] = "No face detected"
+                    results["failed"] += 1
+                    results["entries"].append(entry_result)
+                    continue
+                
+                # Use largest face
+                faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+                x, y, w, h, conf = faces_sorted[0]
+                
+                # Crop face
+                face_crop = img[y:y+h, x:x+w]
+                
+                if face_crop.size == 0:
+                    entry_result["error"] = "Failed to crop face"
+                    results["failed"] += 1
+                    results["entries"].append(entry_result)
+                    continue
+                
+                # Super-resolution if needed
+                if w < 128 or h < 128:
+                    face_crop = video_processor.super_resolve_face(face_crop)
+                
+                # Extract embedding
+                embedding = video_processor.extract_face_embedding(face_crop)
+                
+                if embedding is None:
+                    entry_result["error"] = "Failed to extract embedding"
+                    results["failed"] += 1
+                    results["entries"].append(entry_result)
+                    continue
+                
+                # Generate person ID
+                person_id = f"person_{int(time.time()*1000)}_{idx}"
+                
+                # Save to disk
+                person_dir = Config.FACE_DATABASE_DIR / person_id
+                person_dir.mkdir(exist_ok=True)
+                
+                cv2.imwrite(str(person_dir / "face.jpg"), face_crop)
+                cv2.imwrite(str(person_dir / "original.jpg"), img)
+                np.save(str(person_dir / "embedding.npy"), embedding)
+                
+                metadata = {
+                    "name": name,
+                    "risk_level": risk_level,
+                    "notes": notes,
+                    "added_at": datetime.now().isoformat(),
+                    "source": "bulk_upload"
+                }
+                
+                with open(person_dir / "metadata.json", 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                # Store in memory
+                with surveillance_state.lock:
+                    surveillance_state.face_embeddings_db[person_id] = {
+                        "embedding": embedding,
+                        "metadata": metadata
+                    }
+                
+                entry_result["success"] = True
+                entry_result["person_id"] = person_id
+                results["processed"] += 1
+                
+                print(f"   ✅ [{results['processed']}/{results['total']}] {name}")
+                
+            except Exception as e:
+                entry_result["error"] = str(e)
+                results["failed"] += 1
+                print(f"   ❌ [{idx+1}] {row['name']}: {str(e)}")
+            
+            results["entries"].append(entry_result)
+            
+            # Small delay to avoid overwhelming system
+            await asyncio.sleep(0.01)
+        
+        print(f"\n📦 BULK UPLOAD completed:")
+        print(f"   Total: {results['total']}")
+        print(f"   Processed: {results['processed']}")
+        print(f"   Failed: {results['failed']}")
+        print(f"   Database size: {len(surveillance_state.face_embeddings_db)}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"❌ Bulk upload failed: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
 @app.post("/api/toggle-enhancement")
 async def toggle_enhancement():
     surveillance_state.enhancement_enabled = not surveillance_state.enhancement_enabled
@@ -1175,6 +1456,20 @@ async def set_video_source(
         if not success:
             return {"success": False, "error": "Failed to start video source"}
         
+        # Cancel previous background task if exists
+        global frame_processing_task
+        if frame_processing_task and not frame_processing_task.done():
+            frame_processing_task.cancel()
+            try:
+                await frame_processing_task
+            except asyncio.CancelledError:
+                pass
+            print("   ✅ Cancelled previous frame processing task")
+        
+        # Start background frame processing task
+        frame_processing_task = asyncio.create_task(process_frames_background())
+        print("   ✅ Started background frame processing task")
+        
         print("   ✅ Video source switched successfully")
         
         return {
@@ -1188,6 +1483,86 @@ async def set_video_source(
         
     except Exception as e:
         print(f"❌ Error switching video source: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/start-webcam/{camera_index}")
+async def start_webcam(camera_index: int):
+    """
+    Start webcam with specified camera index
+    0 = Laptop camera
+    1 = DroidCam or external camera
+    2 = Third camera if available
+    """
+    global video_processor, frame_processing_task
+    
+    try:
+        print(f"\n📹 Starting webcam {camera_index}")
+        
+        # Stop existing processor and task if running
+        if video_processor.running:
+            video_processor.stop()
+        
+        # Cancel old background task if exists
+        if frame_processing_task and not frame_processing_task.done():
+            frame_processing_task.cancel()
+            try:
+                await frame_processing_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Create new processor with selected camera
+        video_processor = VideoProcessor(
+            source=camera_index,
+            camera_id=f"CAM-{camera_index:03d}",
+            location=f"Camera {camera_index}",
+            source_type="webcam"
+        )
+        
+        success = video_processor.start()
+        
+        if not success:
+            return {"success": False, "error": f"Failed to open camera {camera_index}"}
+        
+        # Start background frame processing task
+        frame_processing_task = asyncio.create_task(process_frames_background())
+        print(f"   ✅ Background frame processing started")
+        print(f"   ✅ Camera {camera_index} started successfully")
+        
+        return {
+            "success": True,
+            "camera_index": camera_index,
+            "message": f"Camera {camera_index} started"
+        }
+        
+    except Exception as e:
+        print(f"❌ Error starting camera {camera_index}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/stop-stream")
+async def stop_stream():
+    """Stop current video stream"""
+    global video_processor, frame_processing_task
+    
+    try:
+        # Cancel background task
+        if frame_processing_task and not frame_processing_task.done():
+            frame_processing_task.cancel()
+            try:
+                await frame_processing_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Stop processor
+        if video_processor.running:
+            video_processor.stop()
+            print("✅ Video stream stopped")
+        
+        return {"success": True, "message": "Stream stopped"}
+        
+    except Exception as e:
+        print(f"❌ Error stopping stream: {e}")
         return {"success": False, "error": str(e)}
 
 

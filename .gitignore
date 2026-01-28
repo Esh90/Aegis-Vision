@@ -23,14 +23,33 @@ dist-ssr
 *.sln
 *.sw?
 
+# Environment Files - NEVER COMMIT
 .env
+.env.*
 .env.*.local
 .env.local
+backend/.env
+frontend/.env
+
+# Virtual Environments
 /venv
 venv/
 .venv/
+env/
 
 # AI/ML Specifics
-face_database/
-models/*.pt
+face_database/         # Contains sensitive facial data - GDPR/Privacy
+backend/face_database/
+video_uploads/         # May contain large files
+backend/video_uploads/
+models/*.pt           # Large model files
 models/*.pth
+backend/models/*.pt
+*.weights
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
