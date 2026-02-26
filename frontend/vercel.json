@@ -3,6 +3,6 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "rewrites": [
-    { "source": "/api/:path*", "destination": "https://YOUR_RENDER_URL.onrender.com/api/:path*" }
+    { "source": "/api/:path*", "destination": "https://aegis-vision-476p.onrender.com/api/:path*" }
   ]
 }
