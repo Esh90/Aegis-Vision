@@ -4,15 +4,13 @@ logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
 
 node_modules
 dist
 dist-ssr
 *.local
 
-# Editor directories and files
+# Editor
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -23,13 +21,13 @@ dist-ssr
 *.sln
 *.sw?
 
-# Environment Files - NEVER COMMIT
+# Environment - NEVER COMMIT
 .env
 .env.*
-.env.*.local
 .env.local
 backend/.env
 frontend/.env
+frontend/.env.production.local
 
 # Virtual Environments
 /venv
@@ -37,19 +35,31 @@ venv/
 .venv/
 env/
 
-# AI/ML Specifics
-face_database/         # Contains sensitive facial data - GDPR/Privacy
+# AI/ML - large + sensitive
+face_database/
 backend/face_database/
-video_uploads/         # May contain large files
+video_uploads/
 backend/video_uploads/
-models/*.pt           # Large model files
+models/*.pt
 models/*.pth
 backend/models/*.pt
+backend/models/*.pth
 *.weights
+*.onnx
 
-# Python Cache
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Test artifacts
+test_frame*.jpg
+debug_face_*.jpg
+*.test.jpg
+
+# Misc
+*.xlsx
+*.ps1
+render.yaml

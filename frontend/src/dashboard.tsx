@@ -6,8 +6,10 @@ import {
   BarChart3, Play, RefreshCw, Square
 } from 'lucide-react';
 
-const API_BASE = 'http://localhost:8000/api';
-const WS_URL = 'ws://localhost:8000/api/logs';
+const API_BASE = import.meta.env.VITE_API_BASE ?? '/api';
+const WS_URL =
+  import.meta.env.VITE_WS_URL ??
+  `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/logs`;
 
 interface Detection {
   id: string;
@@ -100,7 +102,8 @@ export default function AegisVisionDashboard() {
   const [showSessionStats, setShowSessionStats] = useState(false);
   const [uploadedFile, setUploadedFile] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [selectedCamera, setSelectedCamera] = useState(0);
+  const [streamKey, setStreamKey] = useState(0); // bumped to force <img> reload
+  const [selectedCamera, setSelectedCamera] = useState(1); // 1 = laptop cam (0 is DroidCam virtual)
   const [droidcamIp, setDroidcamIp] = useState(import.meta.env.VITE_DROIDCAM_IP || '');
   const [droidcamPort, setDroidcamPort] = useState(import.meta.env.VITE_DROIDCAM_PORT || '4747');
   
@@ -303,6 +306,9 @@ export default function AegisVisionDashboard() {
         setDetections([]);
         setVideoProgress(null);
         setShowSessionStats(false);
+        setIsStreaming(true);
+        setStreamKey(Date.now());
+        connectWebSocket();
       } else {
         alert(`Source switch failed: ${data.error}`);
       }
@@ -395,6 +401,8 @@ export default function AegisVisionDashboard() {
         console.log('Camera started, connecting WebSocket...');
         setVideoSource({ type: 'webcam', cameraIndex });
         setActiveTab('webcam');
+        setIsStreaming(true);
+        setStreamKey(Date.now()); // force <img> to re-fetch the MJPEG stream
         
         // Connect WebSocket after a short delay to ensure backend is ready
         setTimeout(() => {
@@ -820,11 +828,21 @@ export default function AegisVisionDashboard() {
               
               <div className="relative aspect-video bg-black">
                 {/* Video Stream */}
-                <img 
-                  src={`${API_BASE}/stream`} 
-                  alt="Live surveillance feed"
-                  className="w-full h-full object-cover"
-                />
+                {isStreaming ? (
+                  <img 
+                    key={streamKey}
+                    src={`${API_BASE}/stream?t=${streamKey}`} 
+                    alt="Live surveillance feed"
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center text-gray-500">
+                    <div className="text-center">
+                      <Camera className="w-16 h-16 mx-auto mb-3 opacity-30" />
+                      <p className="text-sm">Start a camera to view the live feed</p>
+                    </div>
+                  </div>
+                )}
                 
                 {/* Scanning Overlay */}
                 <div className="absolute inset-0 pointer-events-none">
